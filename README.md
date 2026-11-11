@@ -19,7 +19,7 @@ The Windows zip and the macOS archive carry libhydrasdr.<br>
 ## Build
 
 CMake 3.16 or later and a C99 compiler.<br>
-Live input needs libhydrasdr 1.1.3 or later; without it, only recordings are read.<br>
+Live input needs libhydrasdr 1.1.4 or later; without it, only recordings are read.<br>
 
 Linux, macOS, Raspberry Pi, with libhydrasdr installed (found by pkg-config):
 

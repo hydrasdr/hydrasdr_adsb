@@ -57,7 +57,7 @@ if(MINGW)
 	target_link_options(hydrasdr_adsb PRIVATE -static)
 endif()
 
-# Live input through libhydrasdr 1.1.3 or later, found by pkg-config or
+# Live input through libhydrasdr 1.1.4 or later, found by pkg-config or
 # given as HYDRASDR_INCLUDE_DIR (holding hydrasdr.h) and HYDRASDR_LIBRARY.
 # On Windows, when they are not given, the latest stable hydrasdr-host
 # release is downloaded. Without libhydrasdr the program reads recordings
@@ -98,8 +98,8 @@ if(WIN32 AND WITH_LIBHYDRASDR AND HYDRASDR_DOWNLOAD AND
 		message(FATAL_ERROR "libhydrasdr release tag '${tag}' not understood")
 	endif()
 	set(ver "${CMAKE_MATCH_1}")
-	if(ver VERSION_LESS 1.1.3)
-		message(FATAL_ERROR "libhydrasdr ${ver} is older than 1.1.3")
+	if(ver VERSION_LESS 1.1.4)
+		message(FATAL_ERROR "libhydrasdr ${ver} is older than 1.1.4")
 	endif()
 	set(zip "hydrasdr-host-tools-Windows-x64-${tag}.zip")
 	set(sha "")
@@ -158,10 +158,28 @@ if(WITH_LIBHYDRASDR AND HYDRASDR_INCLUDE_DIR AND HYDRASDR_LIBRARY)
 elseif(WITH_LIBHYDRASDR)
 	find_package(PkgConfig QUIET)
 	if(PKG_CONFIG_FOUND)
-		pkg_check_modules(LIBHYDRASDR QUIET IMPORTED_TARGET
-			libhydrasdr>=1.1.3)
+		# libhydrasdr.pc carries only MAJOR.MINOR (1.1), so the full
+		# version comes from the HYDRASDR_VER_* lines of hydrasdr.h
+		pkg_check_modules(LIBHYDRASDR QUIET IMPORTED_TARGET libhydrasdr)
 		if(LIBHYDRASDR_FOUND)
-			set(hydrasdr_target PkgConfig::LIBHYDRASDR)
+			find_file(HYDRASDR_H hydrasdr.h
+				HINTS ${LIBHYDRASDR_INCLUDE_DIRS} NO_DEFAULT_PATH)
+			set(hdr_ver "")
+			if(HYDRASDR_H)
+				file(READ "${HYDRASDR_H}" hdr_txt)
+				foreach(p MAJOR MINOR REVISION)
+					string(REGEX MATCH
+						"#define HYDRASDR_VER_${p}[ \t]+([0-9]+)"
+						m "${hdr_txt}")
+					list(APPEND hdr_ver "${CMAKE_MATCH_1}")
+				endforeach()
+				string(REPLACE ";" "." hdr_ver "${hdr_ver}")
+			endif()
+			if(hdr_ver VERSION_GREATER_EQUAL 1.1.4)
+				set(hydrasdr_target PkgConfig::LIBHYDRASDR)
+			else()
+				message(STATUS "libhydrasdr '${hdr_ver}' is older than 1.1.4")
+			endif()
 		endif()
 	endif()
 endif()
