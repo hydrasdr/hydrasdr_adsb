@@ -1,0 +1,782 @@
+name: Build hydrasdr_adsb
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  BUILD_TYPE: Release
+  MAINTAINER: "Benjamin Vernoux <bvernoux@hydrasdr.com>"
+  HOMEPAGE: "https://hydrasdr.com"
+  HOST_REPO: "https://github.com/hydrasdr/hydrasdr-host.git"
+
+jobs:
+  # --------------------------------------------------------------------------
+  # 1. Prepare Version
+  # --------------------------------------------------------------------------
+  prepare:
+    name: Prepare Version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.getver.outputs.version }}
+      rpm_release: ${{ steps.getver.outputs.rpm_release }}
+      host_tag: ${{ steps.getver.outputs.host_tag }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: getver
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Extract the version from project(hydrasdr_adsb VERSION x.y.z)
+          V=$(sed -n 's/^project(hydrasdr_adsb VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
+
+          # Fallback if not found
+          if [ -z "$V" ]; then V="0.0.0"; fi
+
+          # RPM Release (No dashes allowed)
+          SHORT_HASH="${GITHUB_SHA::7}"
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+             RPM_REL="1"
+          else
+             RPM_REL="1.git${SHORT_HASH}"
+          fi
+
+          # libhydrasdr for Linux and macOS: the latest stable hydrasdr-host
+          # release, the one the Windows CMake download takes
+          HOST_TAG=$(gh release view --repo hydrasdr/hydrasdr-host --json tagName -q .tagName)
+          if ! [[ "$HOST_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+             echo "hydrasdr-host release tag '$HOST_TAG' not understood"
+             exit 1
+          fi
+
+          echo "Detected Version: $V, libhydrasdr $HOST_TAG"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "rpm_release=$RPM_REL" >> "$GITHUB_OUTPUT"
+          echo "host_tag=$HOST_TAG" >> "$GITHUB_OUTPUT"
+
+  # --------------------------------------------------------------------------
+  # 2. Windows Build (Visual Studio, the README release zip)
+  # --------------------------------------------------------------------------
+  build-windows:
+    name: Build Windows (MSVC)
+    needs: prepare
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # CMake downloads the latest stable hydrasdr-host release and the
+      # MinGW64 libusb-1.0.dll of the libusb release, both checked by SHA-256
+      - name: Build hydrasdr_adsb
+        shell: bash
+        run: |
+          cmake -S . -B build -A x64 | tee configure.log
+          grep -q "libhydrasdr: live input" configure.log
+          cmake --build build --config ${{ env.BUILD_TYPE }}
+
+      - name: Package Windows Files
+        shell: bash
+        run: |
+          NAME="hydrasdr_adsb-Windows-x64-v${VERSION}"
+          # hydrasdr_adsb.exe, hydrasdr.dll, libusb-1.0.dll, README.md,
+          # LICENSE and licenses/
+          cmake --install build --config ${{ env.BUILD_TYPE }} --prefix "release/$NAME"
+          ls -R release
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: hydrasdr_adsb-Windows-x64-v${{ env.VERSION }}
+          # Upload the directory contents directly
+          path: release/hydrasdr_adsb-Windows-x64-v${{ env.VERSION }}
+
+  # --------------------------------------------------------------------------
+  # 3. macOS Build
+  # --------------------------------------------------------------------------
+  build-macos:
+    name: Build macOS ${{ matrix.arch }}
+    needs: prepare
+    strategy:
+      matrix:
+        include:
+          - os: macos-15-intel
+            arch: x86_64
+          - os: macos-15
+            arch: ARM64
+    runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      HOST_TAG: ${{ needs.prepare.outputs.host_tag }}
+      PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
+    steps:
+      - uses: actions/checkout@v7
+      # cmake is preinstalled on the GitHub macOS images
+      - run: brew install --quiet libusb pkg-config || true
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+          HOMEBREW_NO_INSTALL_CLEANUP: 1
+
+      - name: Build libhydrasdr
+        run: |
+          git clone --depth 1 --branch "$HOST_TAG" "$HOST_REPO" ../hydrasdr-host
+          cmake -S ../hydrasdr-host/libhydrasdr -B ../host-build \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -DCMAKE_INSTALL_PREFIX=/usr/local
+          cmake --build ../host-build -j$(sysctl -n hw.ncpu)
+          sudo cmake --install ../host-build
+
+      - name: Build hydrasdr_adsb
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} | tee configure.log
+          grep -q "libhydrasdr: live input" configure.log
+          cmake --build build -j$(sysctl -n hw.ncpu)
+
+      - name: Package macOS
+        run: |
+          set -e
+          NAME="hydrasdr_adsb-macOS-${{ matrix.arch }}-v${VERSION}"
+          mkdir -p release/$NAME
+          cp build/hydrasdr_adsb README.md LICENSE release/$NAME/
+          cd release/$NAME
+
+          # libhydrasdr and the Homebrew libusb ship next to the program and
+          # are found through @loader_path only, as in the hydrasdr-host
+          # macOS archive
+          HYDRA_REF=$(otool -L hydrasdr_adsb | awk '/libhydrasdr/ {print $1; exit}')
+          SONAME=$(basename "$HYDRA_REF")
+          cp -L "/usr/local/lib/$SONAME" "$SONAME"
+          LIBUSB_REF=$(otool -L "$SONAME" | awk '/libusb-1\.0\.0\.dylib/ {print $1; exit}')
+          cp -L "$LIBUSB_REF" libusb-1.0.0.dylib
+          chmod 755 hydrasdr_adsb "$SONAME" libusb-1.0.0.dylib
+          install_name_tool -id @rpath/libusb-1.0.0.dylib libusb-1.0.0.dylib
+          install_name_tool -change "$LIBUSB_REF" @rpath/libusb-1.0.0.dylib "$SONAME"
+          install_name_tool -id "@rpath/$SONAME" "$SONAME"
+          install_name_tool -change "$HYDRA_REF" "@rpath/$SONAME" hydrasdr_adsb
+          for t in hydrasdr_adsb ./*.dylib; do
+            for r in $(otool -l "$t" | awk '/LC_RPATH/{f=1} f && / path /{print $2; f=0}'); do
+              install_name_tool -delete_rpath "$r" "$t"
+            done
+            install_name_tool -add_rpath @loader_path "$t"
+          done
+          # install_name_tool invalidates the signature, and an arm64 binary
+          # with a broken signature is killed on launch
+          codesign -f -s - ./*.dylib hydrasdr_adsb
+
+          otool -L hydrasdr_adsb "$SONAME"
+          ./hydrasdr_adsb --help > /dev/null
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: hydrasdr_adsb-macOS-${{ matrix.arch }}-v${{ env.VERSION }}
+          # Upload the directory contents directly
+          path: release/hydrasdr_adsb-macOS-${{ matrix.arch }}-v${{ env.VERSION }}
+
+  # --------------------------------------------------------------------------
+  # 4. Ubuntu (DEB)
+  # --------------------------------------------------------------------------
+  build-deb:
+    name: Build DEB ${{ matrix.codename }}
+    needs: prepare
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-26.04
+            version: "26.04"
+            codename: Resolute-Raccoon
+            lts: true
+          - os: ubuntu-24.04
+            version: "24.04"
+            codename: Noble-Numbat
+            lts: true
+          - os: ubuntu-22.04
+            version: "22.04"
+            codename: Jammy-Jellyfish
+            lts: true
+    runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      HOST_TAG: ${{ needs.prepare.outputs.host_tag }}
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update && sudo apt-get install -y build-essential cmake libusb-1.0-0-dev fakeroot git pkg-config
+
+      - name: Build libhydrasdr
+        run: |
+          git clone --depth 1 --branch "$HOST_TAG" "$HOST_REPO" ../hydrasdr-host
+          cmake -S ../hydrasdr-host/libhydrasdr -B ../host-build \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -DCMAKE_INSTALL_PREFIX=/usr
+          cmake --build ../host-build -j$(nproc)
+          sudo cmake --install ../host-build
+
+      - name: Build hydrasdr_adsb
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} | tee configure.log
+          grep -q "libhydrasdr: live input" configure.log
+          cmake --build build -j$(nproc)
+
+      - name: Package DEB
+        run: |
+          PACKAGE_NAME="hydrasdr-adsb"
+          DIST_NAME="Ubuntu-${{ matrix.version }}-LTS-${{ matrix.codename }}"
+          PKG_FILENAME="hydrasdr_adsb-${DIST_NAME}-v${VERSION}.deb"
+
+          mkdir -p debian-pkg/DEBIAN debian-pkg/usr/bin debian-pkg/usr/share/doc/$PACKAGE_NAME
+
+          cp build/hydrasdr_adsb debian-pkg/usr/bin/
+          cp README.md LICENSE debian-pkg/usr/share/doc/$PACKAGE_NAME/
+
+          cat > debian-pkg/DEBIAN/control << EOF
+          Package: $PACKAGE_NAME
+          Version: $VERSION
+          Section: comm
+          Priority: optional
+          Architecture: amd64
+          Depends: hydrasdr-host-tools (>= 1.1.4), libc6
+          Maintainer: ${{ env.MAINTAINER }}
+          Homepage: ${{ env.HOMEPAGE }}
+          Description: Mode S / ADS-B receiver for HydraSDR
+          EOF
+
+          chmod 755 debian-pkg/usr/bin/hydrasdr_adsb
+          fakeroot dpkg-deb --build debian-pkg
+          mv debian-pkg.deb "$PKG_FILENAME"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: hydrasdr_adsb-Ubuntu-${{ matrix.version }}-LTS-${{ matrix.codename }}-v${{ env.VERSION }}
+          path: "*.deb"
+
+  # --------------------------------------------------------------------------
+  # 5. Debian (Container)
+  # --------------------------------------------------------------------------
+  build-debian:
+    name: Build Debian ${{ matrix.codename }}
+    needs: prepare
+    strategy:
+      matrix:
+        include:
+          - version: "13"
+            codename: Trixie
+          - version: "12"
+            codename: Bookworm
+    runs-on: ubuntu-24.04
+    container: debian:${{ matrix.version }}
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      HOST_TAG: ${{ needs.prepare.outputs.host_tag }}
+    steps:
+      - run: export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get install -y build-essential cmake libusb-1.0-0-dev fakeroot git pkg-config
+      - uses: actions/checkout@v7
+
+      - name: Build libhydrasdr
+        run: |
+          git clone --depth 1 --branch "$HOST_TAG" "$HOST_REPO" ../hydrasdr-host
+          cmake -S ../hydrasdr-host/libhydrasdr -B ../host-build \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -DCMAKE_INSTALL_PREFIX=/usr
+          cmake --build ../host-build -j$(nproc)
+          cmake --install ../host-build
+
+      - name: Build hydrasdr_adsb
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} | tee configure.log
+          grep -q "libhydrasdr: live input" configure.log
+          cmake --build build -j$(nproc)
+
+      - name: Package DEB
+        run: |
+          PACKAGE_NAME="hydrasdr-adsb"
+          DIST_NAME="Debian-${{ matrix.version }}-${{ matrix.codename }}"
+          PKG_FILENAME="hydrasdr_adsb-${DIST_NAME}-v${VERSION}.deb"
+
+          mkdir -p debian-pkg/DEBIAN debian-pkg/usr/bin debian-pkg/usr/share/doc/$PACKAGE_NAME
+
+          cp build/hydrasdr_adsb debian-pkg/usr/bin/
+          cp README.md LICENSE debian-pkg/usr/share/doc/$PACKAGE_NAME/
+
+          cat > debian-pkg/DEBIAN/control << EOF
+          Package: $PACKAGE_NAME
+          Version: $VERSION
+          Section: comm
+          Priority: optional
+          Architecture: amd64
+          Depends: hydrasdr-host-tools (>= 1.1.4), libc6
+          Maintainer: ${{ env.MAINTAINER }}
+          Homepage: ${{ env.HOMEPAGE }}
+          Description: Mode S / ADS-B receiver for HydraSDR
+          EOF
+
+          chmod 755 debian-pkg/usr/bin/hydrasdr_adsb
+          fakeroot dpkg-deb --build debian-pkg
+          mv debian-pkg.deb "$PKG_FILENAME"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: hydrasdr_adsb-Debian-${{ matrix.version }}-${{ matrix.codename }}-v${{ env.VERSION }}
+          path: "*.deb"
+
+  # --------------------------------------------------------------------------
+  # 6. Linux Mint
+  # --------------------------------------------------------------------------
+  build-mint:
+    name: Build Mint ${{ matrix.codename }}
+    needs: prepare
+    strategy:
+      matrix:
+        include:
+          - base: ubuntu-24.04
+            version: "22.3"
+            codename: Zena
+          - base: ubuntu-22.04
+            version: "21.3"
+            codename: Virginia
+    runs-on: ${{ matrix.base }}
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      HOST_TAG: ${{ needs.prepare.outputs.host_tag }}
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update && sudo apt-get install -y build-essential cmake libusb-1.0-0-dev fakeroot git pkg-config
+
+      - name: Build libhydrasdr
+        run: |
+          git clone --depth 1 --branch "$HOST_TAG" "$HOST_REPO" ../hydrasdr-host
+          cmake -S ../hydrasdr-host/libhydrasdr -B ../host-build \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -DCMAKE_INSTALL_PREFIX=/usr
+          cmake --build ../host-build -j$(nproc)
+          sudo cmake --install ../host-build
+
+      - name: Build hydrasdr_adsb
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} | tee configure.log
+          grep -q "libhydrasdr: live input" configure.log
+          cmake --build build -j$(nproc)
+
+      - name: Package DEB
+        run: |
+          PACKAGE_NAME="hydrasdr-adsb"
+          DIST_NAME="Linux-Mint-${{ matrix.version }}-${{ matrix.codename }}"
+          PKG_FILENAME="hydrasdr_adsb-${DIST_NAME}-v${VERSION}.deb"
+
+          mkdir -p debian-pkg/DEBIAN debian-pkg/usr/bin debian-pkg/usr/share/doc/$PACKAGE_NAME
+
+          cp build/hydrasdr_adsb debian-pkg/usr/bin/
+          cp README.md LICENSE debian-pkg/usr/share/doc/$PACKAGE_NAME/
+
+          cat > debian-pkg/DEBIAN/control << EOF
+          Package: $PACKAGE_NAME
+          Version: $VERSION
+          Section: comm
+          Priority: optional
+          Architecture: amd64
+          Depends: hydrasdr-host-tools (>= 1.1.4), libc6
+          Maintainer: ${{ env.MAINTAINER }}
+          Homepage: ${{ env.HOMEPAGE }}
+          Description: Mode S / ADS-B receiver for HydraSDR
+          EOF
+
+          chmod 755 debian-pkg/usr/bin/hydrasdr_adsb
+          fakeroot dpkg-deb --build debian-pkg
+          mv debian-pkg.deb "$PKG_FILENAME"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: hydrasdr_adsb-Linux-Mint-${{ matrix.version }}-${{ matrix.codename }}-v${{ env.VERSION }}
+          path: "*.deb"
+
+  # --------------------------------------------------------------------------
+  # 7. Fedora (RPM)
+  # --------------------------------------------------------------------------
+  build-fedora:
+    name: Build Fedora ${{ matrix.version }}
+    needs: prepare
+    strategy:
+      matrix:
+        version: [45, 44]
+    runs-on: ubuntu-24.04
+    container: fedora:${{ matrix.version }}
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      RPM_RELEASE: ${{ needs.prepare.outputs.rpm_release }}
+      HOST_TAG: ${{ needs.prepare.outputs.host_tag }}
+    steps:
+      - run: dnf install -y gcc make cmake libusb1-devel pkgconf-pkg-config rpm-build rpmdevtools git tar gzip
+      - uses: actions/checkout@v7
+
+      - name: Build libhydrasdr
+        run: |
+          git clone --depth 1 --branch "$HOST_TAG" "$HOST_REPO" ../hydrasdr-host
+          cmake -S ../hydrasdr-host/libhydrasdr -B ../host-build \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -DCMAKE_INSTALL_PREFIX=/usr
+          cmake --build ../host-build -j$(nproc)
+          cmake --install ../host-build
+
+      - name: Build hydrasdr_adsb
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} | tee configure.log
+          grep -q "libhydrasdr: live input" configure.log
+          cmake --build build -j$(nproc)
+
+      - name: Package RPM
+        run: |
+          PACKAGE_NAME="hydrasdr_adsb"
+          DIST_NAME="Fedora-${{ matrix.version }}"
+
+          mkdir -p rpm-build/usr/bin
+          cp build/hydrasdr_adsb rpm-build/usr/bin/
+
+          # Create tarball for rpmbuild
+          tar czf rpm-build.tar.gz rpm-build
+
+          mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+          cp rpm-build.tar.gz ~/rpmbuild/SOURCES/
+
+          cat > ~/rpmbuild/SPECS/$PACKAGE_NAME.spec << 'SPEC_EOF'
+          %define debug_package %{nil}
+          # hydrasdr-host-tools is built with AutoReqProv: no, so it does not
+          # provide the libhydrasdr soname; it is required by name below
+          %global __requires_exclude ^libhydrasdr\\.so.*$
+          Name: hydrasdr_adsb
+          Version: %{pkg_version}
+          Release: %{pkg_release}
+          Summary: Mode S / ADS-B receiver for HydraSDR
+          License: MIT
+          URL: https://github.com/hydrasdr/hydrasdr_adsb
+          Source0: rpm-build.tar.gz
+          Requires: hydrasdr-host-tools >= 1.1.4
+
+          %description
+          Mode S / ADS-B receiver for HydraSDR, live through libhydrasdr or from a recording.
+
+          %prep
+          %setup -c -q
+
+          %install
+          mkdir -p %{buildroot}/usr/bin
+          cp -P rpm-build/usr/bin/* %{buildroot}/usr/bin/
+
+          %files
+          /usr/bin/hydrasdr_adsb
+          SPEC_EOF
+
+          rpmbuild -bb ~/rpmbuild/SPECS/$PACKAGE_NAME.spec \
+            --define "pkg_version ${VERSION}" \
+            --define "pkg_release ${RPM_RELEASE}"
+
+          # Rename to match hydrasdr-host convention
+          mv ~/rpmbuild/RPMS/x86_64/*.rpm "${PACKAGE_NAME}-${DIST_NAME}-v${VERSION}.rpm"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: hydrasdr_adsb-Fedora-${{ matrix.version }}-v${{ env.VERSION }}
+          path: "*.rpm"
+
+  # --------------------------------------------------------------------------
+  # 8. AlmaLinux (RPM)
+  # --------------------------------------------------------------------------
+  build-almalinux:
+    name: Build AlmaLinux ${{ matrix.version }}
+    needs: prepare
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        version: [10, 9]
+    container: almalinux:${{ matrix.version }}
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      RPM_RELEASE: ${{ needs.prepare.outputs.rpm_release }}
+      HOST_TAG: ${{ needs.prepare.outputs.host_tag }}
+    steps:
+      - run: dnf install -y gcc make cmake libusb1-devel pkgconf-pkg-config rpm-build rpmdevtools git
+      - uses: actions/checkout@v7
+
+      - name: Build libhydrasdr
+        run: |
+          git clone --depth 1 --branch "$HOST_TAG" "$HOST_REPO" ../hydrasdr-host
+          cmake -S ../hydrasdr-host/libhydrasdr -B ../host-build \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -DCMAKE_INSTALL_PREFIX=/usr
+          cmake --build ../host-build -j$(nproc)
+          cmake --install ../host-build
+
+      - name: Build hydrasdr_adsb
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} | tee configure.log
+          grep -q "libhydrasdr: live input" configure.log
+          cmake --build build -j$(nproc)
+
+      - name: Package RPM
+        run: |
+          PACKAGE_NAME="hydrasdr_adsb"
+          DIST_NAME="AlmaLinux-${{ matrix.version }}"
+
+          mkdir -p rpm-build/usr/bin
+          cp build/hydrasdr_adsb rpm-build/usr/bin/
+
+          tar czf rpm-build.tar.gz rpm-build
+
+          mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+          cp rpm-build.tar.gz ~/rpmbuild/SOURCES/
+
+          cat > ~/rpmbuild/SPECS/$PACKAGE_NAME.spec << 'SPEC_EOF'
+          %define debug_package %{nil}
+          # hydrasdr-host-tools is built with AutoReqProv: no, so it does not
+          # provide the libhydrasdr soname; it is required by name below
+          %global __requires_exclude ^libhydrasdr\\.so.*$
+          Name: hydrasdr_adsb
+          Version: %{pkg_version}
+          Release: %{pkg_release}
+          Summary: Mode S / ADS-B receiver for HydraSDR
+          License: MIT
+          URL: https://github.com/hydrasdr/hydrasdr_adsb
+          Source0: rpm-build.tar.gz
+          Requires: hydrasdr-host-tools >= 1.1.4
+
+          %description
+          Mode S / ADS-B receiver for HydraSDR, live through libhydrasdr or from a recording.
+
+          %prep
+          %setup -c -q
+
+          %install
+          mkdir -p %{buildroot}/usr/bin
+          cp -P rpm-build/usr/bin/* %{buildroot}/usr/bin/
+
+          %files
+          /usr/bin/hydrasdr_adsb
+          SPEC_EOF
+
+          rpmbuild -bb ~/rpmbuild/SPECS/$PACKAGE_NAME.spec \
+            --define "pkg_version ${VERSION}" \
+            --define "pkg_release ${RPM_RELEASE}"
+
+          mv ~/rpmbuild/RPMS/x86_64/*.rpm "${PACKAGE_NAME}-${DIST_NAME}-v${VERSION}.rpm"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: hydrasdr_adsb-AlmaLinux-${{ matrix.version }}-v${{ env.VERSION }}
+          path: "*.rpm"
+
+  # --------------------------------------------------------------------------
+  # 9. openSUSE (RPM)
+  # --------------------------------------------------------------------------
+  build-opensuse:
+    name: Build openSUSE Tumbleweed
+    needs: prepare
+    runs-on: ubuntu-24.04
+    container: opensuse/tumbleweed
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      RPM_RELEASE: ${{ needs.prepare.outputs.rpm_release }}
+      HOST_TAG: ${{ needs.prepare.outputs.host_tag }}
+    steps:
+      - run: zypper install -y git gcc make cmake libusb-1_0-devel pkg-config rpm-build tar gzip
+      - uses: actions/checkout@v7
+
+      - name: Build libhydrasdr
+        run: |
+          git clone --depth 1 --branch "$HOST_TAG" "$HOST_REPO" ../hydrasdr-host
+          cmake -S ../hydrasdr-host/libhydrasdr -B ../host-build \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -DCMAKE_INSTALL_PREFIX=/usr
+          cmake --build ../host-build -j$(nproc)
+          cmake --install ../host-build
+
+      - name: Build hydrasdr_adsb
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} | tee configure.log
+          grep -q "libhydrasdr: live input" configure.log
+          cmake --build build -j$(nproc)
+
+      - name: Package RPM
+        run: |
+          PACKAGE_NAME="hydrasdr_adsb"
+          DIST_NAME="openSUSE-Tumbleweed"
+          RPMBUILD_DIR="$PWD/rpmbuild"
+
+          mkdir -p rpm-build/usr/bin
+          cp build/hydrasdr_adsb rpm-build/usr/bin/
+
+          tar czf rpm-build.tar.gz rpm-build
+
+          mkdir -p ${RPMBUILD_DIR}/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+          cp rpm-build.tar.gz ${RPMBUILD_DIR}/SOURCES/
+
+          cat > ${RPMBUILD_DIR}/SPECS/$PACKAGE_NAME.spec << 'SPEC_EOF'
+          %define debug_package %{nil}
+          # hydrasdr-host-tools is built with AutoReqProv: no, so it does not
+          # provide the libhydrasdr soname; it is required by name below
+          %global __requires_exclude ^libhydrasdr\\.so.*$
+          Name: hydrasdr_adsb
+          Version: %{pkg_version}
+          Release: %{pkg_release}
+          Summary: Mode S / ADS-B receiver for HydraSDR
+          License: MIT
+          URL: https://github.com/hydrasdr/hydrasdr_adsb
+          Source0: rpm-build.tar.gz
+          Requires: hydrasdr-host-tools >= 1.1.4
+
+          %description
+          Mode S / ADS-B receiver for HydraSDR, live through libhydrasdr or from a recording.
+
+          %prep
+          %setup -c -q
+
+          %install
+          mkdir -p %{buildroot}/usr/bin
+          cp -P rpm-build/usr/bin/* %{buildroot}/usr/bin/
+
+          %files
+          /usr/bin/hydrasdr_adsb
+          SPEC_EOF
+
+          rpmbuild -bb ${RPMBUILD_DIR}/SPECS/$PACKAGE_NAME.spec \
+            --define "_topdir ${RPMBUILD_DIR}" \
+            --define "pkg_version ${VERSION}" \
+            --define "pkg_release ${RPM_RELEASE}"
+
+          mv ${RPMBUILD_DIR}/RPMS/x86_64/*.rpm "${PACKAGE_NAME}-${DIST_NAME}-v${VERSION}.rpm"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: hydrasdr_adsb-openSUSE-Tumbleweed-v${{ env.VERSION }}
+          path: "*.rpm"
+
+  # --------------------------------------------------------------------------
+  # 10. Arch Linux
+  # --------------------------------------------------------------------------
+  build-archlinux:
+    name: Build Arch Linux
+    needs: prepare
+    runs-on: ubuntu-24.04
+    container: archlinux:latest
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      HOST_TAG: ${{ needs.prepare.outputs.host_tag }}
+    steps:
+      - run: |
+          # Ensure the archlinux keyring exists and pacman can sign/verify while updating.
+          # Initialize and populate pacman keys BEFORE running pacman -Syu to avoid
+          # "There is no secret key available to sign with." errors in clean containers.
+          pacman -Sy --noconfirm archlinux-keyring || true
+          pacman-key --init || true
+          pacman-key --populate archlinux || true
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm git base-devel cmake libusb sudo
+      - uses: actions/checkout@v7
+
+      # Create non-root user for makepkg
+      - name: Create Builder User
+        run: |
+          useradd -m builder
+          echo "builder ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/builder
+          chmod 0440 /etc/sudoers.d/builder
+
+      - name: Build libhydrasdr
+        run: |
+          git clone --depth 1 --branch "$HOST_TAG" "$HOST_REPO" ../hydrasdr-host
+          cmake -S ../hydrasdr-host/libhydrasdr -B ../host-build \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -DCMAKE_INSTALL_PREFIX=/usr
+          cmake --build ../host-build -j$(nproc)
+          cmake --install ../host-build
+
+      - name: Build hydrasdr_adsb
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} | tee configure.log
+          grep -q "libhydrasdr: live input" configure.log
+          cmake --build build -j$(nproc)
+
+      - name: Package Arch
+        run: |
+          PACKAGE_NAME="hydrasdr_adsb"
+          DIST_NAME="Arch-Linux"
+
+          # Prepare files for packaging from the build tree
+          mkdir -p arch-pkg/usr/bin
+          cp build/hydrasdr_adsb arch-pkg/usr/bin/
+
+          # Create PKGBUILD
+          cat > PKGBUILD << 'EOF'
+          pkgname=hydrasdr_adsb
+          pkgver=${VERSION}
+          pkgrel=1
+          pkgdesc="Mode S / ADS-B receiver for HydraSDR"
+          arch=('x86_64')
+          url="https://github.com/hydrasdr/hydrasdr_adsb"
+          license=('MIT')
+          depends=('hydrasdr-host-tools>=1.1.4')
+          # Disable debug package generation to ensure single .pkg.tar.zst output
+          options=('!debug')
+          package() {
+            install -Dm755 "$startdir/arch-pkg/usr/bin/hydrasdr_adsb" "$pkgdir/usr/bin/hydrasdr_adsb"
+            install -Dm644 "$startdir/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+          }
+          EOF
+
+          # Substitute VERSION
+          sed -i "s/\${VERSION}/${VERSION}/g" PKGBUILD
+
+          # Fix permissions for builder
+          chown -R builder:builder .
+
+          # Run makepkg as builder
+          # --nodeps: hydrasdr-host-tools is a runtime dependency that is
+          # not in the Arch repositories
+          su builder -c "makepkg --nodeps --skipchecksums --noconfirm"
+
+          # Rename to match hydrasdr-host convention
+          mv *.pkg.tar.zst "${PACKAGE_NAME}-${DIST_NAME}-v${VERSION}.pkg.tar.zst"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: hydrasdr_adsb-Arch-Linux-v${{ env.VERSION }}
+          path: "*.pkg.tar.zst"
+
+  # --------------------------------------------------------------------------
+  # 11. Release
+  # --------------------------------------------------------------------------
+  create-release:
+    name: Create Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - build-windows
+      - build-macos
+      - build-deb
+      - build-debian
+      - build-mint
+      - build-fedora
+      - build-almalinux
+      - build-opensuse
+      - build-archlinux
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with: { path: artifacts }
+
+      - name: Prepare Release Files
+        run: |
+          cd artifacts
+          # Zip Windows directories
+          for dir in *Windows*; do
+            [ -d "$dir" ] && zip -r "${dir}.zip" "$dir"
+          done
+          # Tar macOS directories; artifacts do not keep the execute bit
+          for dir in *macOS*; do
+            [ -d "$dir" ] && chmod 755 "$dir"/hydrasdr_adsb "$dir"/*.dylib && \
+              tar czf "${dir}.tar.gz" "$dir"
+          done
+
+      - name: Display structure of downloaded files
+        run: ls -R artifacts
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            artifacts/**/*.zip
+            artifacts/**/*.tar.gz
+            artifacts/**/*.deb
+            artifacts/**/*.rpm
+            artifacts/**/*.pkg.tar.zst
+          generate_release_notes: true
